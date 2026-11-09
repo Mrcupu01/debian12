@@ -1,0 +1,2 @@
+dig @127.0.0.1 contoh.com
+dig @127.0.0.1 google.com
