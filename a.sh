@@ -1,230 +1,228 @@
 
 #!/usr/bin/env bash
 
-# Debian Custom IP
-# Automatic Network Manager Detection
+# Debian BIND9 Automatic Setup
 # License: GNU GPL v2.0
 
 set -Eeuo pipefail
 
 if [[ $EUID -ne 0 ]]; then
-    echo "Error: Jalankan dengan sudo."
+    echo "Jalankan dengan: sudo $0"
     exit 1
 fi
 
-echo "=================================="
-echo "       DEBIAN CUSTOM IP"
-echo "=================================="
-echo
+echo "======================================"
+echo "       DEBIAN BIND9 AUTO SETUP"
+echo "======================================"
 
-# Detect available network managers
-detect_manager() {
-    if compgen -G "/etc/netplan/*.yaml" >/dev/null &&
-       command -v netplan >/dev/null 2>&1; then
-        echo "netplan"
-    elif systemctl is-active --quiet NetworkManager &&
-         command -v nmcli >/dev/null 2>&1; then
-        echo "NetworkManager"
-    elif systemctl is-active --quiet systemd-networkd; then
-        echo "systemd-networkd"
-    elif systemctl is-active --quiet networking &&
-         command -v ifup >/dev/null 2>&1; then
-        echo "ifupdown"
-    else
-        echo "unknown"
-    fi
-}
+# 1. Detect network interface
+IFACE=$(ip -o -4 addr show up scope global |
+    awk '$2 != "lo" {print $2; exit}')
 
-MANAGER=$(detect_manager)
-
-echo "[+] Network manager terdeteksi: $MANAGER"
-echo
-
-if [[ "$MANAGER" == "unknown" ]]; then
-    echo "Tidak menemukan network manager yang aktif."
+if [[ -z "$IFACE" ]]; then
+    echo "Tidak menemukan interface dengan IPv4."
     exit 1
 fi
 
-# Show network interfaces
-echo "Network interfaces:"
-ip -br link
 echo
+echo "[+] Interface terdeteksi: $IFACE"
 
-read -rp "Interface: " IFACE
-read -rp "IP Address: " IP
-read -rp "Prefix [24]: " PREFIX
-PREFIX=${PREFIX:-24}
-read -rp "Gateway (kosong jika tidak tahu): " GW
+read -rp "Gunakan interface ini? (Y/n): " ANSWER
+if [[ "$ANSWER" =~ ^[Nn]$ ]]; then
+    read -rp "Masukkan nama interface: " IFACE
+fi
 
-# Validate interface
 if ! ip link show "$IFACE" >/dev/null 2>&1; then
-    echo "Interface tidak ditemukan!"
+    echo "Interface tidak ditemukan."
     exit 1
 fi
 
-# Validate IP and prefix
-if ! python3 - "$IP" "$PREFIX" "$GW" <<'PY'
-import ipaddress
-import sys
+# 2. Detect IPv4 and subnet
+CIDR=$(ip -o -4 addr show dev "$IFACE" scope global |
+    awk 'NR==1 {print $4}')
 
-try:
-    ipaddress.IPv4Address(sys.argv[1])
-    prefix = int(sys.argv[2])
-    if not 1 <= prefix <= 32:
-        raise ValueError("Prefix harus 1-32")
-    if sys.argv[3]:
-        ipaddress.IPv4Address(sys.argv[3])
-except ValueError as e:
-    print("Konfigurasi tidak valid:", e)
-    sys.exit(1)
-PY
-then
+if [[ -z "$CIDR" ]]; then
+    echo "Interface tidak memiliki IPv4."
     exit 1
 fi
 
-DNS="$IP"
+IP=${CIDR%/*}
+
+SUBNET=$(python3 -c \
+    "import ipaddress; print(ipaddress.ip_interface('$CIDR').network)")
+
+echo "[+] IP       : $IP"
+echo "[+] Subnet   : $SUBNET"
+
+# 3. Domain configuration
+echo
+read -rp "Domain lokal [tkj.test]: " DOMAIN
+DOMAIN=${DOMAIN:-tkj.test}
+
+if ! [[ "$DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]] ||
+   [[ "$DOMAIN" != *.* ]] ||
+   [[ "$DOMAIN" == *..* ]]; then
+    echo "Nama domain tidak valid."
+    exit 1
+fi
+
+DOMAIN=${DOMAIN,,}
+
+read -rp "Nama host [server]: " HOST
+HOST=${HOST:-server}
+
+if ! [[ "$HOST" =~ ^[a-zA-Z0-9-]+$ ]]; then
+    echo "Nama host tidak valid."
+    exit 1
+fi
+
+HOST=${HOST,,}
 
 echo
 echo "========== KONFIGURASI =========="
-echo "Manager   : $MANAGER"
 echo "Interface : $IFACE"
-echo "IP        : $IP/$PREFIX"
-echo "Gateway   : ${GW:-Tidak diatur}"
-echo "DNS       : $DNS"
-echo "================================"
-echo
+echo "IP Server : $IP"
+echo "Subnet    : $SUBNET"
+echo "Domain    : $DOMAIN"
+echo "Host      : $HOST.$DOMAIN"
+echo "================================="
 
-read -rp "Terapkan konfigurasi? (y/n): " CONFIRM
+read -rp "Lanjut instalasi? (y/n): " CONFIRM
 [[ "$CONFIRM" == "y" ]] || exit 0
 
-# NetworkManager
-if [[ "$MANAGER" == "NetworkManager" ]]; then
+# 4. Install packages
+echo
+echo "[+] Menginstal BIND9..."
 
-    CON=$(nmcli -g GENERAL.CONNECTION device show "$IFACE")
+apt-get update
+apt-get install -y bind9 bind9-utils dnsutils
 
-    if [[ -z "$CON" || "$CON" == "--" ]]; then
-        echo "Tidak ada koneksi NetworkManager."
-        exit 1
-    fi
+# 5. Backup existing configurations
+BACKUP="/root/bind9-backup-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$BACKUP"
 
-    nmcli connection modify "$CON" \
-        ipv4.method manual \
-        ipv4.addresses "$IP/$PREFIX" \
-        ipv4.gateway "$GW" \
-        ipv4.dns "$DNS" \
-        ipv4.ignore-auto-dns yes
+cp -a /etc/bind/named.conf.options "$BACKUP/"
+cp -a /etc/bind/named.conf.local "$BACKUP/"
 
-    nmcli connection up "$CON"
-
-# Netplan
-elif [[ "$MANAGER" == "netplan" ]]; then
-
-    FILE="/etc/netplan/99-debian-custom-ip.yaml"
-
-    if [[ -e "$FILE" ]]; then
-        cp -a "$FILE" "$FILE.bak"
-    fi
-
-    cat > "$FILE" <<EOF
-network:
-  version: 2
-  ethernets:
-    $IFACE:
-      dhcp4: false
-      addresses:
-        - $IP/$PREFIX
-EOF
-
-    if [[ -n "$GW" ]]; then
-        cat >> "$FILE" <<EOF
-      routes:
-        - to: default
-          via: $GW
-EOF
-    fi
-
-    cat >> "$FILE" <<EOF
-      nameservers:
-        addresses:
-          - $DNS
-EOF
-
-    chmod 600 "$FILE"
-    netplan generate
-    netplan apply
-
-# systemd-networkd
-elif [[ "$MANAGER" == "systemd-networkd" ]]; then
-
-    FILE="/etc/systemd/network/99-debian-custom-ip.network"
-
-    if [[ -e "$FILE" ]]; then
-        cp -a "$FILE" "$FILE.bak"
-    fi
-
-    cat > "$FILE" <<EOF
-[Match]
-Name=$IFACE
-
-[Network]
-Address=$IP/$PREFIX
-DNS=$DNS
-EOF
-
-    if [[ -n "$GW" ]]; then
-        cat >> "$FILE" <<EOF
-Gateway=$GW
-EOF
-    fi
-
-    networkctl reload
-    networkctl reconfigure "$IFACE"
-
-# ifupdown
-elif [[ "$MANAGER" == "ifupdown" ]]; then
-
-    FILE="/etc/network/interfaces.d/99-debian-custom-ip"
-
-    if grep -RqsE "^[[:space:]]*iface[[:space:]]+$IFACE[[:space:]]+inet" \
-        /etc/network/interfaces /etc/network/interfaces.d/ 2>/dev/null; then
-        echo "Interface sudah memiliki konfigurasi ifupdown."
-        echo "Batalkan agar tidak membuat konfigurasi duplikat."
-        exit 1
-    fi
-
-    mkdir -p /etc/network/interfaces.d
-
-    if ! grep -qE '^[[:space:]]*source(-directory)?[[:space:]]+/etc/network/interfaces.d' \
-        /etc/network/interfaces; then
-        echo "source /etc/network/interfaces.d/*" >> /etc/network/interfaces
-    fi
-
-    cat > "$FILE" <<EOF
-auto $IFACE
-iface $IFACE inet static
-    address $IP
-    netmask $(python3 -c "import ipaddress; print(ipaddress.IPv4Network('0.0.0.0/$PREFIX').netmask)")
-EOF
-
-    if [[ -n "$GW" ]]; then
-        echo "    gateway $GW" >> "$FILE"
-    fi
-
-    if command -v resolvconf >/dev/null 2>&1; then
-        echo "    dns-nameservers $DNS" >> "$FILE"
-    else
-        echo "Peringatan: resolvconf tidak tersedia."
-        echo "DNS perlu dikonfigurasi terpisah."
-    fi
-
-    echo "Konfigurasi disimpan di $FILE"
-    echo "Terapkan saat ada akses lokal: ifdown $IFACE && ifup $IFACE"
+if [[ -e /etc/bind/debian-custom-zones.conf ]]; then
+    cp -a /etc/bind/debian-custom-zones.conf "$BACKUP/"
 fi
 
-echo
-echo "=================================="
-echo "Konfigurasi selesai!"
-echo "=================================="
+if [[ -e "/etc/bind/db.$DOMAIN" ]]; then
+    cp -a "/etc/bind/db.$DOMAIN" "$BACKUP/"
+fi
 
-ip -br addr show "$IFACE"
-ip route
+echo "[+] Backup: $BACKUP"
+
+# 6. Configure BIND options
+cat > /etc/bind/named.conf.options <<EOF
+acl "trusted" {
+    localhost;
+    $SUBNET;
+};
+
+options {
+    directory "/var/cache/bind";
+
+    listen-on port 53 {
+        127.0.0.1;
+        $IP;
+    };
+
+    listen-on-v6 { none; };
+
+    allow-query { trusted; };
+
+    recursion yes;
+    allow-recursion { trusted; };
+    allow-transfer { none; };
+
+    forwarders {
+        1.1.1.1;
+        8.8.8.8;
+    };
+
+    dnssec-validation auto;
+};
+EOF
+
+# 7. Configure DNS zone
+cat > /etc/bind/debian-custom-zones.conf <<EOF
+zone "$DOMAIN" {
+    type master;
+    file "/etc/bind/db.$DOMAIN";
+    allow-transfer { none; };
+};
+EOF
+
+# Add include only once
+if ! grep -qF 'include "/etc/bind/debian-custom-zones.conf";' \
+    /etc/bind/named.conf.local; then
+    echo 'include "/etc/bind/debian-custom-zones.conf";' \
+        >> /etc/bind/named.conf.local
+fi
+
+# 8. Generate DNS records
+SERIAL=$(date +%Y%m%d%H)
+
+cat > "/etc/bind/db.$DOMAIN" <<EOF
+\$TTL 86400
+
+@ IN SOA ns1.$DOMAIN. admin.$DOMAIN. (
+    $SERIAL
+    3600
+    1800
+    604800
+    86400
+)
+
+@       IN NS ns1.$DOMAIN.
+
+ns1     IN A $IP
+$HOST   IN A $IP
+EOF
+
+chown root:bind "/etc/bind/db.$DOMAIN"
+chmod 640 "/etc/bind/db.$DOMAIN"
+
+# 9. Validate configuration
+echo
+echo "[+] Memeriksa konfigurasi..."
+
+named-checkconf
+named-checkzone "$DOMAIN" "/etc/bind/db.$DOMAIN"
+
+# 10. Start BIND9
+echo
+echo "[+] Mengaktifkan BIND9..."
+
+systemctl enable bind9
+systemctl restart bind9
+
+if ! systemctl is-active --quiet bind9; then
+    echo "BIND9 gagal berjalan!"
+    journalctl -u bind9 -n 30 --no-pager
+    exit 1
+fi
+
+# 11. Test DNS
+echo
+echo "======================================"
+echo "       BIND9 BERHASIL AKTIF"
+echo "======================================"
+
+echo "IP DNS : $IP"
+echo "Domain : $DOMAIN"
+echo "Host   : $HOST.$DOMAIN"
+
+echo
+echo "[+] Pengujian DNS lokal:"
+
+dig +short @"$IP" "$HOST.$DOMAIN"
+
+echo
+echo "[+] Status service:"
+systemctl is-active bind9
+
+echo
+echo "Selesai! Backup: $BACKUP"
