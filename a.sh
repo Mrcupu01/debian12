@@ -1,4 +1,3 @@
-
 #!/usr/bin/env bash
 
 # Debian BIND9 Automatic Setup
@@ -12,7 +11,7 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 echo "======================================"
-echo "       DEBIAN BIND9 AUTO SETUP"
+echo "        DEBIAN BIND9 AUTO SETUP"
 echo "======================================"
 
 # 1. Detect network interface
@@ -60,8 +59,8 @@ read -rp "Domain lokal [tkj.test]: " DOMAIN
 DOMAIN=${DOMAIN:-tkj.test}
 
 if ! [[ "$DOMAIN" =~ ^[a-zA-Z0-9.-]+$ ]] ||
-   [[ "$DOMAIN" != *.* ]] ||
-   [[ "$DOMAIN" == *..* ]]; then
+    [[ "$DOMAIN" != *.* ]] ||
+    [[ "$DOMAIN" == *..* ]]; then
     echo "Nama domain tidak valid."
     exit 1
 fi
@@ -192,11 +191,11 @@ echo "[+] Memeriksa konfigurasi..."
 named-checkconf
 named-checkzone "$DOMAIN" "/etc/bind/db.$DOMAIN"
 
-# 10. Start BIND9
+# 10. Start BIND9 (Fixed systemctl enable for Debian 11/12)
 echo
 echo "[+] Mengaktifkan BIND9..."
 
-systemctl enable bind9
+systemctl enable named
 systemctl restart bind9
 
 if ! systemctl is-active --quiet bind9; then
